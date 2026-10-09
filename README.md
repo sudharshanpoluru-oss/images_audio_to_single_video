@@ -6,6 +6,21 @@ Each `image + audio` pair becomes one scene (slideshow-style clip where the imag
 
 Example: `images/1.png` + `audio/1.mp3` → Scene 1, `images/2.png` + `audio/2.mp3` → Scene 2, ... → `output/final_video.mp4`
 
+## 🗺️ Overview Diagram
+
+```mermaid
+flowchart LR
+    IMG[🖼️ images/\n1.png ... 648.png] --> PAIR{🔗 Match by\nnumber}
+    AUD[🔊 audio/\n1.mp3 ... 648.mp3] --> PAIR
+    PAIR -->|1 ↔ 1\n2 ↔ 2| S1[🎞️ scene_000001.mp4]
+    PAIR --> S2[🎞️ scene_000002.mp4]
+    PAIR --> SN[🎞️ scene_000N.mp4]
+    S1 --> CONCAT[📦 concat + copy]
+    S2 --> CONCAT
+    SN --> CONCAT
+    CONCAT --> OUT[🎬 output/\nfinal_video.mp4]
+```
+
 ---
 
 ## ✨ Features
@@ -88,6 +103,29 @@ Supported extensions:
 | Image | `.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp` |
 | Audio | `.mp3`, `.wav`, `.m4a`, `.aac`, `.flac`, `.ogg` |
 
+### 🔗 Number-Matching Flow
+
+```mermaid
+flowchart TD
+    A[📂 Scan folder files] --> B{Has valid\nextension?}
+    B -- No --> X1[⏭️ Skip]
+    B -- Yes --> C[🔢 get_number:\nfirst \d+ in stem]
+    C --> D{Number found?}
+    D -- No --> X2[⏭️ Ignore\n e.g. thumbnail.png]
+    D -- Yes --> E{Number already\nseen?}
+    E -- Yes --> ERR[❌ Duplicate number error]
+    E -- No --> F[✅ files[number] = path]
+```
+
+```mermaid
+flowchart LR
+    I1[1.png] <--> A1[1.mp3]
+    I2[2.png] <--> A2[2.mp3]
+    I10[10.png] <--> A10[10.mp3]
+```
+
+> Numeric sort is used, so play order is `1 → 2 → 10`, not `1 → 10 → 2`.
+
 ---
 
 ## 🚀 Usage (GUI)
@@ -125,9 +163,86 @@ Supported extensions:
 
 6. Use **🔄 Refresh** any time to rescan the folders after adding/removing files.
 
+### 🖱️ GUI User Flow
+
+```mermaid
+flowchart TD
+    START([▶ Launch app]) --> AUTO[🔍 auto_detect_folders\nimages/ audio/ output/]
+    AUTO --> SEL[📁 Browse / confirm\n3 folders]
+    SEL --> REF[🔄 refresh_status\ncount + matching check]
+    REF --> DISP{Matching?}
+    DISP -- "Images:0 / Audio:0" --> WAIT[⌛ -- Waiting for folders]
+    DISP -- "READY ✓" --> BTN[▶ CREATE VIDEO]
+    DISP -- "CHECK FILES ⚠" --> FIX[🛠️ Fix names/counts\n+ Refresh]
+    FIX --> REF
+    BTN --> PRE[✅ Pre-flight check\nsets equal?]
+    PRE -- Mismatch --> POPERR[❌ Popup: Missing audio/images]
+    PRE -- Match --> CONF{Confirm dialog\nStart?}
+    CONF -- No --> BTN
+    CONF -- Yes --> THR[🧵 Background thread\ncreate_video_thread]
+    THR --> DONE[🎉 Popup: Video Created\nfinal_video.mp4]
+```
+
 ---
 
 ## 🧠 How It Works (Pipeline)
+
+### 🔄 End-to-End Encoding Pipeline
+
+```mermaid
+flowchart TD
+    S([▶ make_video called]) --> FF{check_ffmpeg?\nffmpeg -version}
+    FF -- Not found --> E0[❌ Raise: Install FFmpeg]
+    FF -- OK --> SCAN1[🔍 collect_files images]
+    SCAN1 --> SCAN2[🔍 collect_files audio]
+    SCAN2 --> EMPTY{Empty?}
+    EMPTY -- Yes --> E1[❌ No numbered files]
+    EMPTY -- No --> MATCH{image_numbers ==\naudio_numbers?}
+    MATCH -- No --> E2[❌ Images without audio /\nAudio without images]
+    MATCH -- Yes --> TMP[📂 mkdtemp video_maker_]
+    TMP --> LOOP[🔁 For each number sorted]
+    LOOP --> ENC[🎞️ ffmpeg -loop 1 + -shortest\nscale/pad → 1920x1080\nlibx264 + aac]
+    ENC --> PROG[📊 progress 0→90%\nlog [i/N] Creating scene]
+    PROG --> MORE{More scenes?}
+    MORE -- Yes --> LOOP
+    MORE -- No --> CONC[📝 Write concat.txt]
+    CONC --> JOIN[📦 ffmpeg -f concat -c copy\n→ final_video.mp4]
+    JOIN --> P100[📊 progress 100%]
+    P100 --> CLN[🧹 rmtree temp_dir]
+    CLN --> OK([✅ Return output_file, count])
+    E0 & E1 & E2 --> CLN
+```
+
+### 🎞️ Single-Scene Detail
+
+```mermaid
+flowchart LR
+    IMGIN[🖼️ 1.png\n-loop 1 = infinite stills] --> VF[🎨 -vf scale + pad\nfit → 1920x1080\nblack bars, no stretch]
+    AUDIN[🔊 1.mp3] --> MUX[🎬 -shortest ends\nwhen audio ends]
+    VF --> ENC2[⚙️ -r 30 libx264 medium\ncrf 20 yuv420p + aac 192k\n+faststart]
+    MUX --> ENC2
+    ENC2 --> SC[🎞️ scene_000001.mp4]
+```
+
+### 🧵 Threading Model
+
+```mermaid
+sequenceDiagram
+    participant U as 👤 User / GUI
+    participant M as 🖥️ Main Thread (Tk)
+    participant T as 🧵 Worker Thread
+    participant F as ⚙️ FFmpeg
+    U->>M: Click ▶ CREATE VIDEO
+    M->>M: Pre-check + confirm dialog
+    M->>T: threading.Thread(create_video_thread)
+    loop For each pair
+        T->>F: run_ffmpeg(scene_N)
+        F-->>T: scene_N.mp4
+        T->>M: root.after → progress/log update
+    end
+    T->>F: run_ffmpeg(concat → final_video.mp4)
+    T->>M: root.after → finished / failed popup
+```
 
 `make_video(images_folder, audio_folder, output_folder, progress_callback, log_callback)`:
 
